@@ -149,16 +149,33 @@ let unsubscribeAuthState: (() => void) | null = null;
 /** ownership store 按 DbClient 实例缓存(避免每 tick 建对象);换库(换账号)自动重建 */
 let ownershipStoreCache: { db: unknown; store: OwnershipStore } | null = null;
 const pendingPeerLinkReopens = new Set<string>();
+let pendingPeerLinkReopenRetryTimer: ReturnType<typeof setTimeout> | null = null;
+
+function schedulePendingPeerLinkReopenRetry(): void {
+  if (pendingPeerLinkReopenRetryTimer !== null || linkTornDown) return;
+  if (arbiter && !arbiter.isOwner()) return;
+  pendingPeerLinkReopenRetryTimer = setTimeout(() => {
+    pendingPeerLinkReopenRetryTimer = null;
+    flushPendingPeerLinkReopens();
+  }, 5_000);
+  pendingPeerLinkReopenRetryTimer.unref?.();
+}
 
 function flushPendingPeerLinkReopens(): void {
   if (linkTornDown || (arbiter && !arbiter.isOwner())) return;
   for (const deviceId of pendingPeerLinkReopens) {
     log.debug(`peer link stale-frame recovery for ${deviceId.slice(0, 8)}`);
     void openRemoteLink(deviceId).then(
-      () => pendingPeerLinkReopens.delete(deviceId),
+      () => {
+        pendingPeerLinkReopens.delete(deviceId);
+        if (pendingPeerLinkReopens.size === 0 && pendingPeerLinkReopenRetryTimer !== null) {
+          clearTimeout(pendingPeerLinkReopenRetryTimer);
+          pendingPeerLinkReopenRetryTimer = null;
+        }
+      },
       (err) => {
         log.debug(`peer link stale-frame recovery failed for ${deviceId.slice(0, 8)}`, err);
-        setTimeout(flushPendingPeerLinkReopens, 5_000);
+        schedulePendingPeerLinkReopenRetry();
       },
     );
   }
@@ -769,6 +786,11 @@ export function getMobileNotifyGeneration(): number {
 function teardownActiveLink(): void {
   if (!client || linkTornDown) return;
   linkTornDown = true;
+  if (pendingPeerLinkReopenRetryTimer !== null) {
+    clearTimeout(pendingPeerLinkReopenRetryTimer);
+    pendingPeerLinkReopenRetryTimer = null;
+  }
+  pendingPeerLinkReopens.clear();
   mobileNotifyGeneration += 1;
   if (relayAuthRecoveryRetryTimer !== null) {
     clearTimeout(relayAuthRecoveryRetryTimer);
@@ -867,16 +889,15 @@ export function clearDeviceResponsiveness(deviceId: string): void {
 
 /**
  * 系统睡眠唤醒:立即重连而不是干等退避计时器(最坏 30s)+ 心跳判死(~45s)。
- * 只在本实例仍持有 relay、链路确实不在线时 un-park;connectNow 对 stopped client
- * 会重新拉起连接,所以必须先过 linkTornDown / 持有权双闸,不能绕过仲裁。
+ * 只在本实例仍持有 relay 时触发；系统恢复还要强制丢弃可能“半开”的 live socket，
+ * 所以必须先过 linkTornDown / 持有权双闸，不能绕过仲裁。
  */
 export function handleDeviceLinkSystemResume(): void {
   if (!client || linkTornDown) return;
   if (arbiter && !arbiter.isOwner()) return;
   if (!authManager.getAuthState().isAuthenticated) return;
-  if (client.getStatus() === 'online') return;
   log.info('system resume: reconnecting device-link immediately');
-  client.connectNow('system-resume');
+  client.connectNow('system-resume', { force: true });
 }
 
 export function getDeviceLinkConnectionIssue(): DeviceLinkConnectionIssue | null {
