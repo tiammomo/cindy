@@ -133,6 +133,8 @@ export function createResponsivenessTracker(
   const log = deps.log ?? { info: () => {}, warn: () => {}, debug: () => {} };
   const unresponsive = new Set<string>();
   const linkRecoveryInFlight = new Map<string, Promise<unknown>>();
+  /** 同一设备并发业务请求共享一个 timeout cohort，避免一次链路故障重复计 strike。 */
+  const activeCohorts = new Map<string, { cohort: number; count: number }>();
   const breaker = createDeviceResponsivenessBreaker({
     now: deps.now,
     onOpenChanged: (deviceId, open) => {
@@ -149,21 +151,38 @@ export function createResponsivenessTracker(
     breaker.settle(deviceId, slot, outcome);
   };
 
+  const releaseCohort = (deviceId: string, slot: BreakerSendSlot): void => {
+    if (slot.decision !== 'allow') return;
+    const active = activeCohorts.get(deviceId);
+    if (!active || active.cohort !== slot.cohort) return;
+    if (active.count <= 1) activeCohorts.delete(deviceId);
+    else active.count -= 1;
+  };
+
   const guardInvoke = async <T>(
     deviceId: string,
     channel: string,
     run: () => Promise<T>,
   ): Promise<T> => {
-    const slot = breaker.acquire(deviceId);
+    const active = activeCohorts.get(deviceId);
+    const cohort = active?.cohort ?? breaker.createCohort(deviceId);
+    const slot = breaker.acquire(deviceId, cohort);
     if (slot.decision === 'reject') throw createDeviceUnresponsiveError(deviceId);
+    if (slot.decision === 'allow') {
+      const current = activeCohorts.get(deviceId);
+      if (current?.cohort === cohort) current.count += 1;
+      else activeCohorts.set(deviceId, { cohort, count: 1 });
+    }
     const wasProbe = slot.decision === 'probe';
     try {
       const result = await run();
       settle(deviceId, slot, classifyDeviceSendSuccess(channel, wasProbe));
+      releaseCohort(deviceId, slot);
       return result;
     } catch (err) {
       const outcome = classifyDeviceSendFailure(err);
       settle(deviceId, slot, outcome);
+      releaseCohort(deviceId, slot);
       if (outcome === 'timeout' && deps.recoverLink && !linkRecoveryInFlight.has(deviceId)) {
         let recovery: Promise<unknown>;
         try {
@@ -208,9 +227,13 @@ export function createResponsivenessTracker(
     probeTick,
     isUnresponsive: (deviceId) => unresponsive.has(deviceId),
     getUnresponsiveDeviceIds: () => [...unresponsive],
-    clearDevice: (deviceId) => breaker.clear(deviceId),
+    clearDevice: (deviceId) => {
+      activeCohorts.delete(deviceId);
+      breaker.clear(deviceId);
+    },
     resetAll: () => {
       linkRecoveryInFlight.clear();
+      activeCohorts.clear();
       breaker.resetAll();
     },
   };

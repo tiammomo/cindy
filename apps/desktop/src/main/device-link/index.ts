@@ -860,6 +860,11 @@ export function getUnresponsiveDeviceIds(): string[] {
   return responsivenessTracker?.getUnresponsiveDeviceIds() ?? [];
 }
 
+/** 本机禁用目标设备控制时清除响应性熔断，避免重新启用后继承旧的 open 状态。 */
+export function clearDeviceResponsiveness(deviceId: string): void {
+  responsivenessTracker?.clearDevice(deviceId);
+}
+
 /**
  * 系统睡眠唤醒:立即重连而不是干等退避计时器(最坏 30s)+ 心跳判死(~45s)。
  * 只在本实例仍持有 relay、链路确实不在线时 un-park;connectNow 对 stopped client
