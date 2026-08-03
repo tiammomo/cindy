@@ -134,11 +134,13 @@ export function startRemoteSessionsReconciler(
   intervalMs = RECONCILE_INTERVAL_MS,
   backoff: ReconcileBackoff = createReconcileBackoff({ baseMs: intervalMs }),
 ): () => void {
+  const inFlight = new Set<string>();
   const timer = setInterval(() => {
     const seen = new Set<string>();
     for (const [deviceId, name] of getEligibleDevices()) {
       seen.add(deviceId);
-      if (!backoff.shouldAttempt(deviceId)) continue;
+      if (!backoff.shouldAttempt(deviceId) || inFlight.has(deviceId)) continue;
+      inFlight.add(deviceId);
       void refresh(deviceId, name)
         .then((result) => {
           backoff.report(
@@ -149,11 +151,17 @@ export function startRemoteSessionsReconciler(
         .catch((err) => {
           backoff.report(deviceId, 'failure');
           log.debug(`periodic sessions reconcile failed for ${deviceId.slice(0, 8)}`, err);
+        })
+        .finally(() => {
+          inFlight.delete(deviceId);
         });
     }
     backoff.retainOnly(seen);
   }, intervalMs);
-  return () => clearInterval(timer);
+  return () => {
+    clearInterval(timer);
+    inFlight.clear();
+  };
 }
 
 type IneligibleRemoteProjectAction = 'disconnect' | 'remove' | 'ignore';
