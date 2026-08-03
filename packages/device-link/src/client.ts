@@ -128,6 +128,8 @@ export interface DeviceLinkClientOptions {
   getHello(): HelloPayload;
   createWebSocket: WsFactory;
   logger?: DeviceLinkLogger;
+  /** 对端仍发送可靠帧但本地 peer 未 ready 时通知 host 触发一次去重重开。 */
+  onPeerLinkNeedsReopen?: (deviceId: string) => void;
   /** 测试注入:覆盖重连/心跳的时间参数 */
   timing?: Partial<DeviceLinkTiming>;
 }
@@ -336,6 +338,7 @@ export class DeviceLinkClient {
   private readonly opts: DeviceLinkClientOptions;
   private readonly timing: DeviceLinkTiming;
   private readonly log: DeviceLinkLogger;
+  private readonly staleLinkRepairAt = new Map<string, number>();
 
   private ws: WsLike | null = null;
   private status: DeviceLinkStatus = 'stopped';
@@ -1528,6 +1531,18 @@ export class DeviceLinkClient {
       // pub/sub 帧可能被投到同 deviceId 的新进程；提前执行会绕过新基线并重复副作用。
       // 不回 ACK，让仍存活的发送端在链路重新建立后按同 seq 重放。
       this.log.debug(`dropping reliable payload before link is ready from ${env.src.slice(0, 8)}`);
+      if (!peer.explicitlyClosed) {
+        const now = Date.now();
+        const last = this.staleLinkRepairAt.get(env.src) ?? 0;
+        if (now - last >= 5_000) {
+          this.staleLinkRepairAt.set(env.src, now);
+          try {
+            this.opts.onPeerLinkNeedsReopen?.(env.src);
+          } catch (err) {
+            this.log.debug(`peer link reopen callback failed for ${env.src.slice(0, 8)}`, err);
+          }
+        }
+      }
       return { handled: true };
     }
     if (peer.remoteStreamId && peer.remoteStreamId !== parsed.meta.streamId) {
